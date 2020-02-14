@@ -87,6 +87,14 @@ class QConsolidateDialog(QDialog):
         self.checkBoxZip = QCheckBox('Consolidate in a Zip file')
         self.cb = QComboBox()
         self.cb.addItems(["SHP", "GeoPackage"])
+        self.checkBoxConvert = QCheckBox('Convert layer types')
+        self.folderName_lbl = QLabel('Folder Name')
+        self.folderName = QLineEdit()
+        self.folderName.setText("Tables")
+
+        self.folderName_hlayout = QHBoxLayout()
+        self.folderName_hlayout.addWidget(self.folderName_lbl)
+        self.folderName_hlayout.addWidget(self.folderName)
 
         self.label = QLabel("Output directory")
         self.leOutputDir = QLineEdit()
@@ -112,7 +120,9 @@ class QConsolidateDialog(QDialog):
         self.h_layout.addWidget(self.leOutputDir)
         self.h_layout.addWidget(self.btnBrowse)
         self.v_layout.addLayout(self.h_layout)
+        self.v_layout.addLayout(self.folderName_hlayout)
 
+        self.v_layout.addWidget(self.checkBoxConvert)
         self.v_layout.addWidget(self.cb)
         self.v_layout.addWidget(self.checkBoxZip)
         self.v_layout.addWidget(self.buttonBox)
@@ -176,10 +186,16 @@ class QConsolidateDialog(QDialog):
                 return
 
         # create directory for layers if not exists
-        if d.exists("layers"):
+        tablesFolderName = self.folderName.text()
+        if not tablesFolderName:
+            msg = tr("Please specify the output table folder name.")
+            log_msg(msg, level='C', message_bar=iface.messageBar())
+            self.restoreGui()
+            return
+        if d.exists(tablesFolderName):
             res = QMessageBox.question(
                 self, self.tr("Directory exists"),
-                self.tr("Output directory already contains 'layers'"
+                self.tr("Output directory already contains '" + tablesFolderName + "'"
                         " subdirectory. Maybe this directory was used to"
                         " consolidate another project. Continue?"),
                 QMessageBox.Yes | QMessageBox.No)
@@ -187,7 +203,7 @@ class QConsolidateDialog(QDialog):
                 self.restoreGui()
                 return
         else:
-            if not d.mkdir("layers"):
+            if not d.mkdir(tablesFolderName):
                 msg = tr("Can't create directory for layers.")
                 log_msg(msg, level='C', message_bar=iface.messageBar())
                 self.restoreGui()
@@ -216,7 +232,7 @@ class QConsolidateDialog(QDialog):
         # start consolidate task that does all real work
         self.consolidateTask = ConsolidateTask(
             'Consolidation', QgsTask.CanCancel, outputDir, newProjectFile,
-            self.checkBoxZip.isChecked(), self.cb.currentText())
+            self.checkBoxZip.isChecked(), self.cb.currentText(), self.checkBoxConvert.isChecked(), tablesFolderName)
         self.consolidateTask.begun.connect(self.on_consolidation_begun)
 
         QgsApplication.taskManager().addTask(self.consolidateTask)

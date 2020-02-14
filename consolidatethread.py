@@ -45,8 +45,10 @@ from qgis.core import (
 from qgis.utils import iface
 
 from osgeo import gdal
-from shutil import copyfile
+from shutil import copyfile, copy2, copytree
 from .utils import log_msg
+from glob import glob
+import string
 
 class TaskCanceled(Exception):
     pass
@@ -54,17 +56,20 @@ class TaskCanceled(Exception):
 
 class ConsolidateTask(QgsTask):
 
-    def __init__(self, description, flags, outputDir, projectFile, saveToZip, isSHP):
+    def __init__(self, description, flags, outputDir, projectFile, saveToZip, isSHP, doConvert, tablesFolder):
         super().__init__(description, flags)
         self.outputDir = outputDir
-        self.layersDir = outputDir + "/layers"
+        self.layersDir = outputDir + "/"+tablesFolder
         self.projectFile = projectFile
         self.saveToZip = saveToZip
+        self.doConvert = doConvert
         self.isSHP = (isSHP == "SHP")
         if self.isSHP:
             QgsMessageLog.logMessage("SHP export selected", 'QConsolidate3', level=Qgis.Info)
         self.progressMax = None
         self.setDependentLayers(QgsProject.instance().mapLayers().values())
+
+        #print((self.outputDir, self.layersDir, self.projectFile, self.saveToZip, self.doConvert, self.isSHP, self.progressMax))
 
     def run(self):
         try:
@@ -91,6 +96,8 @@ class ConsolidateTask(QgsTask):
 
     def consolidate(self):
         gdal.AllRegister()
+
+        self.layersMapping = dict()
 
         # read project
         doc = self.loadProject()
@@ -123,27 +130,31 @@ class ConsolidateTask(QgsTask):
             lName = layer.name()
             lID = layer.id()
             lUri = layer.dataProvider().dataSourceUri()
-            if lType == QgsMapLayer.VectorLayer:
-                # Always convert to GeoPackage
-                outFile = self.convertGenericVectorLayer(
-                    e, layer, lName, lID)
-                outFiles.append(outFile)
-            elif lType == QgsMapLayer.RasterLayer:
-                #QgsMessageLog.logMessage("!!!!RasterLayer: '%s', provider '%s'" % (lName, lProviderType), 'QConsolidate3', level=Qgis.Info)
+            if self.doConvert:
+                if lType == QgsMapLayer.VectorLayer:
+                    # Always convert to GeoPackage
+                    outFile = self.convertGenericVectorLayer(
+                        e, layer, lName, lID)
+                    outFiles.append(outFile)
+                elif lType == QgsMapLayer.RasterLayer:
+                    #QgsMessageLog.logMessage("!!!!RasterLayer: '%s', provider '%s'" % (lName, lProviderType), 'QConsolidate3', level=Qgis.Info)
 
-                # FIXME: should we convert also this to GeoPackage?
-                if lProviderType == 'gdal':
-                    if self.checkGdalWms(lUri):
-                        #QgsMessageLog.logMessage("!!!!CopyRasterLayer: '%s'" % lName, 'QConsolidate3', level=Qgis.Info)
-                        outFile = self.copyXmlRasterLayer(e, layer, lName, lID)
-                        outFiles.append(outFile)
-                    else:
-                        #QgsMessageLog.logMessage("!!!!CopyRasterLayer not WMS: '%s'" % lName, 'QConsolidate3', level=Qgis.Info)
-                        outFile = self.copyRasterLayer(e, layer, lName, lID)
-                        outFiles.append(outFile)
+                    # FIXME: should we convert also this to GeoPackage?
+                    if lProviderType == 'gdal':
+                        if self.checkGdalWms(lUri):
+                            #QgsMessageLog.logMessage("!!!!CopyRasterLayer: '%s'" % lName, 'QConsolidate3', level=Qgis.Info)
+                            outFile = self.copyXmlRasterLayer(e, layer, lName, lID)
+                            outFiles.append(outFile)
+                        else:
+                            #QgsMessageLog.logMessage("!!!!CopyRasterLayer not WMS: '%s'" % lName, 'QConsolidate3', level=Qgis.Info)
+                            outFile = self.copyRasterLayer(e, layer, lName, lID)
+                            outFiles.append(outFile)
+                else:
+                    raise TypeError('Layer %s (type %s) is not supported'
+                                    % (lName, lType))
             else:
-                raise TypeError('Layer %s (type %s) is not supported'
-                                % (lName, lType))
+                    outFile = self.copyLayer(e, layer)
+                    outFiles.append(outFile)
             self.setProgress(i / self.progressMax * 100)
             if self.isCanceled():
                 raise TaskCanceled('Consolidation canceled')
@@ -206,6 +217,70 @@ class ConsolidateTask(QgsTask):
                 if self.isCanceled():
                     raise TaskCanceled('Consolidation canceled')
 
+    def copyLayer(self, layerElement, vLayer):
+        providerURI = vLayer.dataProvider().dataSourceUri()
+        providerName = vLayer.dataProvider().name()
+
+        log_msg(providerURI, level='I')
+        QgsMessageLog.logMessage("Provider: " + providerName + "; File: " + providerURI, 'QConsolidate3', level=Qgis.Info)
+
+        if providerName not in ('ogr', 'gdal', 'delimitedtext'):
+            if providerName not in ('wms'):
+                QgsMessageLog.logMessage("Unhandled provider '" + providerName + "'. Skipping.", 'QConsolidate3', level = Qgis.Warn)
+            return
+
+        # strip pipe component
+        pipeComponent = providerURI[providerURI.find("|"):]
+        providerURI = providerURI[:providerURI.find("|")]
+
+        hasQuery = False
+        queryComponent = ""
+
+        # handle query strings
+        if providerURI[:8] == "file:///":
+            hasQuery = True
+            queryComponent = providerURI[providerURI.find("?"):]
+            providerURI = providerURI[8:providerURI.find("?")]
+            providerURI = providerURI.replace("%20", " ")
+
+
+        # Check if we already have copied this data source
+        if providerURI in self.layersMapping.keys():
+            outFile = self.layersMapping[providerURI]
+        else:
+            # copy the file(s)
+
+            filename = os.path.basename(providerURI)
+
+            outFile = "%s/%s" % (self.layersDir, filename)
+            uriNoExtension = os.path.splitext(providerURI)[0]
+
+            # check if the file is a directory (i.e. gdb)
+            if os.path.isdir(providerURI):
+                # copy tree
+                copytree(providerURI, outFile)
+            else:
+                # get all files to copy (same name, diff ext)
+                files = glob(uriNoExtension + ".*")
+                for f in files:
+                    src = f
+                    dst = os.path.splitext(outFile)[0] + os.path.splitext(src)[1]
+                    copy2(src, dst)
+
+            self.layersMapping[providerURI] = outFile
+
+
+        if hasQuery:
+            outFile = outFile.replace(" ", "%20")
+            outFile = "file:///" + outFile + queryComponent
+
+        outFile = outFile + pipeComponent
+
+        # update project
+        layerNode = self.findLayerInProject(layerElement, vLayer.id())
+        tmpNode = layerNode.firstChildElement("datasource")
+        tmpNode.firstChild().setNodeValue(outFile)
+
     def copyXmlRasterLayer(self, layerElement, vLayer, layerName, layerID):
         outFile = "%s/%s.xml" % (self.layersDir, layerName)
         try:
@@ -217,7 +292,7 @@ class ConsolidateTask(QgsTask):
         # update project
         layerNode = self.findLayerInProject(layerElement, layerID)
         tmpNode = layerNode.firstChildElement("datasource")
-        p = "./layers/%s.xml" % layerName
+        p = "./" + self.layersDir + "/%s.xml" % layerName
         tmpNode.firstChild().setNodeValue(p)
         tmpNode = layerNode.firstChildElement("provider")
         tmpNode.firstChild().setNodeValue("gdal")
@@ -241,7 +316,7 @@ class ConsolidateTask(QgsTask):
         # update project
         layerNode = self.findLayerInProject(layerElement, layerID)
         tmpNode = layerNode.firstChildElement("datasource")
-        p = "./layers/%s%s" % (vlayerName, extension)
+        p = "./" + self.layersDir + "/%s%s" % (vlayerName, extension)
         tmpNode.firstChild().setNodeValue(p)
         tmpNode = layerNode.firstChildElement("provider")
         tmpNode.firstChild().setNodeValue("gdal")
